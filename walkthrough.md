@@ -1,0 +1,598 @@
+# Walkthrough
+
+Append-only log of changes made to this workspace.
+
+---
+
+## 2026-10-17 — Pear Music navbar logo replacement
+
+### Goal
+Replace the YouTube Music logo (red play icon + "Music" wordmark) in the
+top-left of the WebView2 nav bar with the project's own Pear Music logo.
+
+### Root cause found (blocked the whole feature)
+`ui/inject.js` had a **fatal syntax error** at the `injectWindowControls()`
+function: raw `<button>…</button>` HTML was assigned to `controls.innerHTML`
+with no string delimiter.
+
+```js
+controls.innerHTML =
+  <button class="tauri-win-btn" id="tauri-btn-min" ...>   // <-- no quotes
+```
+
+Because the whole file is a single IIFE, the parse error meant **none of it
+executed at all** — including the pre-existing `replaceNavbarLogo()`, the Geist
+font override, the ad skipper, and the `ytm:song-change` / `ytm:state-change`
+IPC bridge. The logo was already coded but had never once rendered.
+
+### Files modified
+
+**`ui/inject.js`** (Tauri `frontendDist`; compiled into the binary via
+`include_str!` in `src-tauri/src/lib.rs`)
+- Wrapped the window-controls `innerHTML` in a template literal — fixes the
+  parse error.
+- `.catch(() => {})` on `invokeBackend()` so rejected commands don't throw
+  unhandled rejections in the page console.
+- Replaced bare-mousedown `app_start_drag` with a 5px movement threshold plus
+  an `e.buttons & 1` guard. `start_dragging()` opens a modal move loop, so
+  firing it on mousedown would have swallowed clicks in the nav bar.
+- Consolidated `isInteractive()` for both the drag and dblclick handlers.
+- Deleted the duplicated 7 KB base64 blob that also lived in the CSS block.
+  The logo is now defined once as `PEAR_LOGO_DATA_URL`.
+- Replaced malformed CSS selectors (`picture.ytmusic-nav-bar` is a compound of
+  a tag and a class, so it never matched) with real ones, plus
+  `source { display: none }` so `<picture>` skips YouTube's light/dark theme
+  variants and falls through to the plain `<img src>`.
+- `replaceNavbarLogo()` now also re-asserts when `src` has drifted (the old
+  `dataset` guard alone missed the case where YouTube re-renders and resets
+  `src` on an already-visited element), and strips `sizes` as well as `srcset`.
+
+**`src-tauri/src/lib.rs`**
+- Registered the four commands the injected titlebar calls but Rust never
+  provided: `app_minimize`, `app_toggle_maximize`, `app_start_drag`, `app_close`.
+- Added a `main_window()` helper. These controls live in the `"main"` webview
+  and must never fall back to the `"settings"` window.
+- `app_close` calls `win.close()` rather than `app.exit()` so the existing
+  close-to-tray handler in `setup()` still applies.
+
+### Asset used
+`ui/pear-logo-nav.png` (185×56, 5,281 B) — pear icon + white "Music" on
+transparent. Chosen because it mirrors the exact "icon + wordmark" layout of
+the slot it replaces, and it is already sized for a 24px-tall nav bar.
+
+### Decisions / rationale
+- Kept the base64 data URL rather than loading the file at runtime. The Tauri
+  frontend has no bundler (no Vite/Rollup, no `?raw`), and the injected script
+  runs on the remote `music.youtube.com` origin where `ui/` is not addressable.
+- Native Windows titlebar left in place; the injected min/max/close now
+  coexist with it rather than replacing it. Removing it would mean
+  `.decorations(false)`, which costs resize borders and snap — out of scope here.
+
+### Verification
+- `node --check ui/inject.js` → clean (was `SyntaxError: Unexpected token '<'`).
+- `cargo build` → clean, no warnings.
+- DOM test with `happy-dom` against a mock of the real
+  `ytmusic-nav-bar > .left-content > a.logo > picture > (source, source, img)`
+  markup — 13/13 checks passed, covering src swap, `<source>` removal, srcset
+  stripping, sizing, idempotency, re-render resilience, and that unrelated nav
+  images are untouched. Also asserted the embedded PNG is **byte-identical**
+  to `ui/pear-logo-nav.png`.
+- Confirmed the logo base64 and all four command names are present in the built
+  `app.exe`.
+- Restored `ui/inject.js` to LF line endings (`.editorconfig` sets
+  `end_of_line = lf`); a PowerShell edit had briefly converted it to CRLF.
+
+### Follow-ups not done
+- `ui/pear-icon.png`, `ui/transparent-pear-music-logo.{png,webp}` and
+  `ui/user-uploaded-logo.webp` remain unreferenced. `user-uploaded-logo.webp`
+  is byte-identical to `transparent-pear-music-logo.webp` (same SHA-256).
+- `pnpm test:debug` is called by `.github/workflows/build.yml` but no such
+  script exists in `package.json` — CI is already broken, unrelated to this work.
+---
+
+## 2026-10-17 � Logo made robust (dual-channel) + kawarp investigation
+
+### Why the first logo fix appeared to fail
+The screenshot showed no rounded corners, no Geist font and no window controls,
+which proved the *entire* `inject.js` was failing to execute, not just the logo
+part. Node's `--check` had passed, so the file parsed; the failure was that a
+single 30 KB IIFE gave every feature one shared fate.
+
+### Fixes
+- **`ui/logo.js` (new, generated by `tools/gen-logo-inject.cjs`)** � a small,
+  self-contained, CSS-first logo injector with no shared globals or execution
+  path with `inject.js`. Hides YouTube's `<picture>` and paints the artwork with
+  a `::after` pseudo-element, which is immune to YouTube re-writing `img.src` on
+  nav-bar re-renders (the mechanism that defeated the earlier src-swapping).
+- **Two injection channels** in `src-tauri/src/lib.rs`: a second
+  `.initialization_script(...)` *and* `.on_page_load(...) -> eval`. Either
+  surviving is sufficient. This is what actually fixed it.
+- **`diag_log` / `diag_read` / `diag_clear` commands** append to
+  `%TEMP%\pear-ytm-diag.log`. Injected-script failures are otherwise invisible:
+  there is no console unless devtools are open, and one throw hides everything
+  downstream.
+
+### Verified
+`node --check` clean, `cargo build` clean, and a `PrintWindow` screenshot capture
+confirms the green pear + "Music" wordmark renders in the nav bar.
+
+### Side finding (unresolved, needs attention)
+The injected script's `invoke('diag_log', ...)` calls **never reached Rust** �
+zero log lines � even though the script demonstrably runs. So page-to-Rust IPC
+appears to be blocked. Likely cause: the capabilities file in
+`src-tauri/capabilities/default.json`. This probably also means the injected
+min/max/close buttons do not work. Worth verifying before building on IPC.
+
+### Line-ending hygiene
+Twice now, a PowerShell `[System.IO.File]::WriteAllLines` call silently converted
+a source file to CRLF, violating `.editorconfig` (`end_of_line = lf`). Both
+`ui/inject.js` and `src-tauri/src/lib.rs` were converted back to LF. Prefer the
+edit tool or a node one-liner over PowerShell for file writes in this repo.
+
+### kawarp
+Cloned to temp and analysed; strategy written to `kawarp-integration-plan.md`.
+Key facts: `@kawarp/core` is a zero-dependency WebGL renderer (Kawase blur +
+domain warping). Album art CORS verified OK (`i.ytimg.com` returns
+`Access-Control-Allow-Origin: *`), so no Rust proxy is needed. The `loadVideo`
+path is unusable because YouTube streams cross-origin, so we get album-art
+crossfade rather than a live video visualiser.
+
+---
+
+## 2026-10-17 � Pivot to Better Lyrics; kawarp scaffolding removed
+
+### Removed (the kawarp detour)
+- `ui/kawarp.js`, `tools/build-kawarp.js`, and all throwaway probe scripts.
+- `@kawarp/core` + `esbuild` devDependencies (esbuild was only needed to bundle it).
+- The `kawarp_script` injection and the `pearbg=` request channel in `lib.rs`.
+- `gen:inject` now only regenerates `ui/logo.js`.
+
+This also removed the green page tint and the green slider artefact: they came
+from a status channel (`html[data-pear-state] { background: ... }`) that was only
+ever a debugging aid.
+
+### Better Lyrics, vendored
+`vendor/better-lyrics/` -- unmodified copy of the release asset
+`chrome-v3.0.0.zip` (96 files, 5.1 MB). Provenance in
+`vendor/better-lyrics/PROVENANCE.md`.
+
+Loaded via WebView2 rather than reimplemented:
+`WebviewWindowBuilder::additional_browser_args` with
+`--load-extension`, plus `--disable-features=DisableLoadExtensionCommandLineSwitch`
+because WebView2 blocks that switch by default. Added to
+`bundle.resources` so it ships.
+
+Extension id is derived from the manifest `key`:
+`effdbpeggelllpfkjppbokhmmiinhlmg` (`tools/ext-id.mjs`).
+
+### Two Windows path bugs that made the extension silently fail to load
+Both produce the same symptom -- the extension never registers and its
+`chrome-extension://` origin resolves to `invalid` -- so they are worth
+recording:
+
+1. **`..` in the path.** `CARGO_MANIFEST_DIR/../vendor/...` reaches Chromium
+   uncanonicalised, because Chromium does not resolve the `--load-extension`
+   value. Fixed by deriving the repo root with `.parent()` instead.
+2. **Verbatim path prefix.** `Path::canonicalize()` on Windows returns
+   `\\?\C:\...`; replacing `\` with `/` for the switch turned that into
+   `//?/C:/...`, which Chromium cannot use. Fixed by stripping the `\\?\` (and
+   `\\?\UNC\`) prefix before normalising separators.
+
+### inject.js conflicts with Better Lyrics
+Disabling `ui/inject.js` made the layout correct, so our injected CSS is
+fighting the extension. Removed the worst offenders:
+- a universal `* { font-family: ... !important }` plus per-element-type font
+  rules -- Better Lyrics drives its lyric typography off exactly these, and
+  the global override was silently flattening it;
+- `overflow: hidden` on `html, body, ytmusic-app` -- Better Lyrics sizes its
+  own scroll containers and clipping the root broke them;
+- the 136px `ytmusic-nav-bar > .right-content` reservation, which only existed
+  for window buttons whose IPC does not work.
+
+An overflow remains (the right-hand UP NEXT/LYRICS panel is pushed past the
+window edge), so at least one more cause is still in inject.js.
+
+### Open findings
+- Better Lyrics' MAIN-world content script does appear to run (BL-styled lyric
+  highlighting is visible), so extension loading is not a total no-op -- but
+  WebView2 extension support is partial and this is fragile.
+- Page-to-Rust Tauri IPC still does not work from the remote
+  `music.youtube.com` origin: `invoke()` never reaches `diag_log`. The
+  injected window controls depend on it and are therefore non-functional.
+  Suspect `src-tauri/capabilities/default.json`.
+
+---
+
+## 2026-10-17 — Better Lyrics now loads for real (WebView2 Extensions API)
+
+### Goal
+Get the vendored Better Lyrics 3.0.0 extension to actually run inside the
+WebView2 app: genuine `chrome.*` APIs, its service worker, and its content
+scripts injecting into music.youtube.com.
+
+### Root cause found
+The `--load-extension` command-line route never worked, and cannot:
+
+- CDP ground truth showed **no extension service worker, no isolated world,
+  no DOM markers** even with a clean, correct path and
+  `--disable-features=DisableLoadExtensionCommandLineSwitch`.
+- WebView2 gates extensions at the **environment level**: the switch is
+  ignored unless the environment is created with `AreBrowserExtensionsEnabled`
+  and the extension is registered via
+  `ICoreWebView2Profile7::AddBrowserExtension`.
+
+The good news: **wry 0.57 / Tauri 2.12.4 expose this natively** —
+`WebviewWindowBuilder::browser_extensions_enabled()` and
+`WebviewWindowBuilder::extensions_path()`; no COM plumbing needed.
+
+### Files modified
+
+**`vendor/better-lyrics` -> `vendor/extensions/better-lyrics`**
+- wry registers *one extension per child folder* of `extensions_path`, so the
+  extension had to move one level down into a clean base directory.
+
+**`src-tauri/tauri.conf.json`**
+- Bundle resources mapping updated to
+  `"../vendor/extensions/better-lyrics": "extensions/better-lyrics"` so the
+  bundled copy lands in `resource_dir/extensions/`, matching the runtime
+  resolution logic.
+
+**`src-tauri/src/lib.rs`**
+- `find_extension()` -> `find_extensions_dir()`: now resolves the **parent**
+  directory of the extension folders (`PEAR_BL_EXT` now means "a directory
+  containing extension folders"); resolution order unchanged.
+- Deleted `browser_args_with_extension()` and the whole `--load-extension`
+  string-building path (dead end, see root cause).
+- Window builder now gets `.browser_extensions_enabled(true)` +
+  `.extensions_path(dir)` when a directory is found.
+- Added a one-shot reload 8s after window build: `AddBrowserExtension` is
+  asynchronous and the initial navigation misses `document_start` content
+  scripts, so the page reloads once to pick them up.
+
+**`tools/ext-id.mjs`** — default manifest path updated.
+
+**`tools/cdp-probe.mjs`** (new) — lists CDP targets / execution contexts and
+probes BL markers. **`tools/cdp-lyrics-check.mjs`** (new) — drives the page to
+a track, opens the Lyrics tab, probes the DOM and saves a screenshot. Launch
+the app with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
+(the env var merges with the app's own browser args) to use them.
+
+### Verification
+- Browser process cmdline now includes
+  `--embedded-browser-webview-enable-extension`.
+- CDP targets:
+  `service_worker chrome-extension://effdbpeggelllpfkjppbokhmmiinhlmg/background/service_worker.js`
+  (alive — `chrome.runtime.id` answers), plus an isolated execution context
+  named "Better Lyrics (Lyrics for YouTube Music)" on the YTM frame.
+- On a track with the Lyrics tab open: **1813 `blyrics-*` nodes**,
+  `.blyrics-container` present, BL's fullscreen control pill rendered;
+  screenshot confirms styled synced lyrics.
+- Pear logo still renders (independent injection path unaffected).
+
+### Open findings
+- The 8s startup reload is a visible one-time flash on every launch; refine
+  later (e.g. only reload on the profile's first launch).
+- The earlier UP NEXT/LYRICS overflow no longer reproduces in the verified
+  screenshot; treat as resolved pending further checks.
+- `kawarp-integration-plan.md` is a stale artifact of the abandoned kawarp
+  approach; delete when convenient.
+- Page-to-Rust IPC (`invoke('diag_log')`) is still broken; window control
+  buttons remain non-functional. Unrelated to the extension work.
+
+---
+
+## 2026-10-17 — Page-to-Rust IPC fixed (Tauri v2 ACL app manifest)
+
+### Root cause found
+CDP evaluation in the live page showed the IPC transport itself was fine —
+`window.__TAURI_INTERNALS__.invoke` existed — but every command rejected with
+`diag_log not allowed. Plugin not found`.
+
+In Tauri 2.12.4 (`webview/mod.rs` ~2080) a request is ACL-checked when it is a
+plugin command, when the app defines an ACL manifest, or **when it comes from a
+non-local (remote) origin**. App commands (`diag_log`, `app_*`, ...) only
+resolve through the ACL when the app defines an *application manifest*
+(`tauri-build` `AppManifest::commands`), which auto-generates `allow-$command`
+/ `deny-$command` permissions. Without it the lookup fails with
+`Plugin not found` — so every page-to-Rust invoke from music.youtube.com was
+rejected silently (call sites swallow rejections with `.catch(() => {})`).
+
+### Files modified
+
+**`src-tauri/build.rs`**
+- Now uses `tauri_build::Attributes::new().app_manifest(
+  AppManifest::new().commands(&[...all 10 app commands...]))` +
+  `tauri_build::try_build(...)`.
+- Generates `src-tauri/permissions/autogenerated/*.toml` (one allow/deny pair
+  per command; identifiers slugified, e.g. `diag_log` becomes `allow-diag-log`).
+
+**`src-tauri/capabilities/default.json`**
+- Added the 10 `allow-*` permissions to the existing `default` capability.
+  The capability already has `remote.urls` for music.youtube.com; `remote` is
+  additive (also applies locally) and `windows: ["main","settings"]` covers
+  both windows. Important: with an app manifest present, *local* windows are
+  ACL-checked too, so `get_settings`/`save_settings` needed allowing for the
+  settings window as well.
+
+**`tools/cdp-eval.mjs`** (new)
+- Generic CDP evaluator for the live page; preset `ipc` runs the full bridge
+  diagnostic. Usage: `node tools/cdp-eval.mjs ipc`.
+
+### Verification (rebuilt, relaunched with CDP on 9222)
+- `invoke('diag_log', ...)` resolves from music.youtube.com; the entry
+  `[page] cdp-eval ipc preset` appears at the tail of `%TEMP%\pear-ytm-diag.log`.
+- `invoke('get_settings')` returns the real settings object (discord_rpc,
+  sponsorblock, close_to_tray, precise_volume, auto_skip_ads, font_family,
+  font_weight).
+- Same session: Better Lyrics service worker and isolated world still present.
+- Consequence: the window control buttons (`app_minimize`, `app_toggle_maximize`,
+  `app_start_drag`, `app_close`) and the `plugin:event|emit` song/state bridge
+  are now usable from the page.
+
+## 2026-10-17 — Better Lyrics settings port + Settings-window WebView2 fixes
+
+### Better Lyrics settings window (`bl-settings`)
+
+Ported the extension's toolbar-popup UI (`action/index.html`, byte-identical
+to `options/index.html`) into its own 560x600 window, opened from a new
+"Better Lyrics Settings" card in the app's own settings page.
+
+**`src-tauri/src/lib.rs`**
+- `better_lyrics_id()` — derives the extension id the way Chrome does: SHA-256
+  over the base64-decoded manifest `key`, first 16 bytes, nibbles mapped `0-f`
+  -> `a-p`. Deliberately path-independent (mirrors `tools/ext-id.mjs`), so the
+  same id resolves in dev and in an installed resource dir.
+- `open_bl_settings_window` (async): re-invoke focuses the existing window;
+  otherwise builds an `about:blank` window carrying the main window's
+  extension options, then a retry thread navigates host-side to
+  `chrome-extension://<id>/action/index.html` (400 ms, then 1 s x 7). Two
+  WebView2 behaviours forced this: navigations to `chrome-extension://` issued
+  before the fresh environment's `AddBrowserExtension` completes are dropped
+  (window settled on WebView2's default start page), and page-initiated
+  navigations to extension URLs are rejected with `ERR_BLOCKED_BY_CLIENT`.
+
+**`src-tauri/Cargo.toml`** — added `sha2` and `base64`.
+
+**`build.rs` / `capabilities/default.json`** — registered
+`open_bl_settings_window` (the usual both-places rule); the `bl-settings`
+window intentionally gets no ACL entry (it only talks to `chrome.*`, never
+the Tauri IPC).
+
+**`ui/settings.html`** — new "Better Lyrics" section + `#open_bl_settings`
+button (`.btn` style) invoking the command.
+
+### `open_settings_window`: IPC crash and 0x8007139F
+
+First-ever IPC invocation of the app's Settings window exposed two bugs the
+tray-only path had hidden:
+1. As a *synchronous* command it created the webview inline on the main
+   thread's WebView2 callback — re-entering the message pump. Observed as a
+   silent process death (no WER entry, consistent with an unwinding panic).
+2. Its builder did not carry the extension environment options that the main
+   window now uses, so even off-thread, `build()` failed with
+   `HRESULT 0x8007139F` (ERROR_INVALID_STATE): WebView2 rejects a webview
+   whose environment options differ from the environment already created in
+   the process.
+
+Fixes: split `open_settings_window_impl` (sync core — tray keeps calling it on
+the event loop) from an `async` command wrapper; give the impl the same
+`browser_extensions_enabled(true)` + `extensions_path(dir)` options as main
+when the extensions dir resolves. Both the command and the tray item now log
+through diag (`open_settings: creating window` / `window built` / `build
+failed: ...` / `page_load ...`).
+
+### Verification (rebuilt, CDP session)
+- IPC `invoke('open_settings_window')` -> `open_settings: window built` ->
+  `page_load Started/Finished for http://tauri.localhost/settings.html`.
+- Clicking `#open_bl_settings` inside the settings window ->
+  `open_bl_settings: opening chrome-extension://effdbpeggelllpfkjppbokhmmiinhlmg/action/index.html`
+  -> `window built` -> `loaded on attempt 2 (...#general-content)`.
+- Screenshots: `%TEMP%\app-settings-window.png` (new Better Lyrics card),
+  `%TEMP%\bl-settings-window.png` (full BL 3.0.0 UI, real cache stats read
+  from chrome.storage: 6 lyrics / 149.17 KB).
+
+## 2026-10-18 — Geist Medium across YouTube Music: reviving the injected bridge
+
+### Root cause: the bridge died at document-start
+
+`inject.js` runs as a WebView2 initialization script at document-created
+time, when `document.head` and `document.documentElement` can **both** be
+null. `applyCustomFont()`'s `(document.head || document.documentElement)
+.appendChild(style)` threw a TypeError and aborted the whole IIFE. Silent
+consequences: no font style, no IPC `message` listener, no polling loop, no
+window controls; only code registered before the throw survived (fetch/XHR
+interceptors, the `skipAds` interval, the `ytInitialPlayerResponse` getter).
+
+Proof: `ytInitialPlayerResponse` carried exactly the accessor descriptor
+`inject.js` installs (so the script ran to at least that point), a `set-font`
+postMessage was a no-op, and neither `#tauri-custom-font` nor
+`#tauri-window-controls` existed anywhere in the live page.
+
+### Fixes (`ui/inject.js`)
+
+1. **`ensureFontStyleEl()`** — module-level ref + deferred attach
+   (`readystatechange`/`DOMContentLoaded`) + duplicate cleanup. The first
+   guard version had a race: the async settings load called
+   `applyCustomFont` before the deferred attach ran; a second
+   `getElementById` miss created a *duplicate* style element that silently
+   overrode the real one (stale weight 500).
+2. **Global Geist Medium CSS with BL carve-out** —
+   `html, html *:not([class*="blyrics"], [class*="blyrics"] *)` with
+   `font-family` + `font-weight !important`, driven by
+   `--tauri-font-family` / `--tauri-font-weight` vars so `set-font`
+   re-themes at runtime. Better Lyrics keeps full control of its subtree;
+   YTM icon-font elements were verified absent before going universal.
+3. **Window controls hidden** (`display:none !important`) — the window uses
+   the native titlebar, so reviving the buttons would only overlap YTM's
+   top-right icons. Wiring kept for a future frameless window.
+4. **Polling loop steps individually try/catch'd** — one broken step (player
+   API not ready on a fresh page) must not starve the rest of the tick.
+5. **Trusted Types** — YTM enforces CSP TrustedHTML, so the window-controls
+   `innerHTML` assignment threw *every tick* ("This document requires
+   'TrustedHTML' assignment") and the buttons never appended. Rebuilt with
+   `createElement` / `createElementNS`.
+
+### Verification (rebuilt, CDP on 9222)
+
+- Cold start: exactly 1 `#tauri-custom-font` (`len 6489`), body/h2/player-bar
+  Geist w500, `fonts.check(500 16px Geist)` true.
+- IPC: postMessage `set-font` 600 -> body w600; restore 500 -> w500.
+- Window controls: element present, computed `display: none`; no TrustedHTML
+  errors after the fix.
+- Better Lyrics untouched: `blyrics--line` Switzer w600 30px under the
+  Geist everything-else; word-highlight keeps its own weight.
+- Screenshot `%TEMP%\pear-font-fixed.png` (Geist chrome + BL lyrics + pear
+  logo).
+
+### Dev-loop notes
+
+- Killing an instance must include its orphaned WebView2 processes for
+  `com.pear.desktop`; otherwise the next launch reuses a grace-period
+  browser process and silently drops
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` (no CDP port).
+- New tool `tools/cdp-console.mjs`: reloads the page and captures console +
+  exceptions live — this is how the TrustedHTML flood was found.
+
+---
+
+## 2026-10-18 — Maximized launch, performance pass, Performance Mode
+
+### Launch maximized
+Main window now launches maximized (`.maximized(true)` on the main
+`WebviewWindowBuilder`; native titlebar kept). Verified via Win32
+`IsZoomed` on the "YouTube Music" HWND — note CDP
+`Browser.getWindowForTarget` reports `windowState: normal` even when
+zoomed, so it is unreliable for this and must not be used for the check.
+
+### Performance pass (both injected UI scripts)
+- `ui/inject.js` (hand-written — rebuilt and verified):
+  - Ad-skip poller 10 Hz unconditional -> adaptive: 100 ms only while a
+    video is active (`!paused || seeking`), 1000 ms otherwise.
+  - Main 400 ms fixed loop -> adaptive: 400 ms while playing, 1200 ms
+    paused/idle.
+  - Removed the duplicate ad-skip block in `updateSongInfo()` (skipAds()
+    already covers it with more button variants; the copy just doubled
+    per-tick DOM work).
+  - `replaceNavbarLogo()` early-outs when `#pear-nav-logo-css` exists —
+    the img-swap was only a fallback for a missing stylesheet, and the
+    swap path has to fight YouTube re-writing `img.src` anyway.
+- `tools/gen-logo-inject.cjs` (template) -> regenerated `ui/logo.js`:
+  - `ensureStyle()` caches the CSS string once (was: rebuilt per call)
+    and only writes `textContent` at element creation.
+  - `reassert()` early-outs once the nav is marked `data-pear-logo="active"`
+    (was: `getComputedStyle()` on the `::after` pseudo element per call).
+  - `MutationObserver` now coalesces mutation bursts to <= 1 reassert per
+    250 ms (was: reassert per mutation frame on YTM's churning DOM).
+  - Heartbeat 1000 ms -> 2000 ms.
+
+### Startup reload 8 s -> 3 s
+The post-launch `window.location.reload()` that guarantees extension
+content scripts land on a load exists because `AddBrowserExtension`
+registers asynchronously; evidence (the bl-settings window's navigation
+retries; "loaded on attempt 2" at ~1.4 s) says registration completes well
+under 3 s, and the old 8 s wait just discarded more page work. In
+Performance Mode (no extensions) the reload is skipped entirely.
+
+### Performance Mode (setting)
+- `AppSettings.performance_mode` (`#[serde(default)]`, default false) ->
+  checkbox in a new **Performance** section in `ui/settings.html`; the BL
+  "Open" button is disabled while it's on. Restart-scoped ("Takes effect
+  after restart" in the copy).
+- Rationale: WebView2 fixes extension environment flags when the first
+  webview is created, and mismatched environment options between windows
+  fail with `0x8007139F`. So the flag is snapshotted at startup
+  (`SettingsState.perf_mode_at_startup`) and every window builder reads
+  the snapshot, never the live setting:
+  - main window: `browser_extensions_enabled`/`extensions_path` skipped,
+  - settings window: same skip (else the mismatch),
+  - `open_bl_settings_window`: early return with a diag line,
+  - reload thread: skipped (`extensions_dir` is `None`).
+- Perf mode keeps Geist + the Pear logo (both are app-injected, not
+  extension-provided).
+
+### Files modified
+`src-tauri/src/lib.rs` (maximized, snapshot read, extension gating on all
+builders, reload 3 s), `src-tauri/src/settings.rs` (`performance_mode`,
+`perf_mode_at_startup`), `ui/settings.html` (Performance section, wiring,
+`.btn:disabled` styling), `ui/inject.js`, `tools/gen-logo-inject.cjs`
+(+ regenerated `ui/logo.js`).
+
+### Verification (rebuilt, CDP on 9222)
+- Launch: Win32 `IsZoomed` true on the main window; stays maximized
+  through page load. (One external `SW_MINIMIZE` made it iconic — after
+  `SW_RESTORE` it returns to zoomed and stays there, so no un-maximize
+  bug.)
+- Normal mode: extensions dir found; reload diag line at ~5 s wall clock
+  (3 s timer + webview build time); Better Lyrics service-worker target
+  present in `/json/list`; played a song: 59 `.blyrics--line` rendered
+  (Switzer w600) with the Geist carve-out intact; logo confirmed; Geist
+  on body.
+- Performance mode: diag "performance mode: extension load skipped"; no
+  reload line; zero `[class*="blyrics"]` elements and no extension target
+  in `/json/list`; logo `data-pear-logo="active"`; Geist on body; settings
+  window builds and loads (no `0x8007139F`); `open_bl_settings` logs the
+  guard line and opens nothing; settings screenshot shows the new
+  Performance section with the BL button disabled
+  (`%TEMP%\pear-settings-perf.png`).
+- The store already contained `performance_mode: true` when the test run
+  started, so that launch served as the perf-mode test configuration;
+  restored to `false` and re-verified normal mode end to end.
+
+## 2026-10-18 — Crossfade between songs (fade-through, customizable duration)
+
+### What was built
+A crossfade between consecutive songs with a 1-12 s adjustable duration,
+applied live from the settings window (no restart). Because the Youtube
+Music web player now streams via SABR (player responses carry no direct
+stream URLs - verified empirically: all formats `hasUrl: false`, and the
+alternate `android_music`/`ios_music` clients return `LOGIN_REQUIRED`),
+two overlapping sources are not reachable from inside the page. The
+implementation is therefore a sample-accurate fade-through: an equal-power
+fade-out lands exactly on the end of the outgoing track, and the incoming
+track fades up from silence. The result is a smooth, gap-free transition
+(no true overlap; honestly documented).
+
+### Design
+- Web Audio gain graph: lazy `AudioContext` + `GainNode`
+  (`ctx -> gain(1) -> MediaElementSource -> destination`), created only
+  after the context is confirmed `running`, so a suspended context can
+  never silence playback.
+- Equal-power curves (`sin`/`cos`, 65 points) scheduled with
+  `setValueCurveAtTime`; fade-out armed by the poll tick when
+  `remaining <= duration + 0.2 s`; fade-in on the `playing` event when a
+  fade-out handed off. Guards: pause freezes the fade, resume ramps to 1,
+  backward seek restores full volume, `ended`/`emptied` hand off state,
+  skip buttons get a quick 0.45 s fade, ads force gain 1, disabling the
+  setting ramps back to 1. Disabled = zero overhead (no context, no nodes).
+- Settings: `crossfade_enabled` (bool, default false) and
+  `crossfade_duration` (seconds, default 4.0), `#[serde(default)]`-
+  compatible with existing settings.json. `SettingsState::update`
+  piggybacks a `postMessage('set-crossfade')` on the existing set-font
+  eval, and inject.js also reads `get_settings` at init.
+- UI: Crossfade section in settings.html - toggle plus a 1-12 s slider
+  (step 0.5, value label), debounced save (400 ms), matching accent
+  styling; the duration row is hidden while disabled.
+
+### Files modified
+`src-tauri/src/settings.rs` (fields, default fn, Default impl, live
+postMessage in `update()`), `ui/settings.html` (range-picker styles,
+Crossfade section, load/save/listener wiring), `ui/inject.js` (crossfade
+engine, video-event hooks, message branch, poll step). No new Tauri
+commands, so no capability changes.
+
+### Verification (rebuilt, CDP on 9222)
+- `node --check` on inject.js and the settings.html inline script: OK;
+  `cargo build` finished clean.
+- Live config path: `save_settings` -> Rust -> postMessage -> page
+  reflected `enabled: true, duration: 3` without reload.
+- End-of-track capture (seek to `duration - 6`): fade-out armed at
+  3.2 s remaining (`t=190.6/193.4`), equal-power decline `1.0 -> 0.15 ->
+  0.008`, `fadedOut` at track end, next track (different duration)
+  faded in from `0.079 -> 0.979` over exactly the configured 3 s, then
+  `idle` at 1.0. Full curve logged via `%TEMP%\opencode\xfade-sample2.js`.
+- Skip button: click -> immediate fade toward 0, new track sine fade-in
+  captured (0.487 @ 1 s, 0.79 @ 1.7 s, idle at 3.15 s).
+- Disable path: gain restored to 1.00, engine idle, no muting.
+  Re-enabled with duration 4.0 (final state left active at 4 s).
+- Steady-state playback unaffected: context `running`, gain 1.0, no
+  volume knockdown or audible artifacts.
