@@ -32,3 +32,7 @@ base64 = "0.22"
 souvlaki = "0.8.3"
 discord-rich-presence = "1.1.0"
 adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+
+[profile.release]
+strip = true
+lto = "thin"

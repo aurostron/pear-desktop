@@ -41,6 +41,9 @@ fn diag_log_path() -> std::path::PathBuf {
 ///   1. `PEAR_BL_EXT` env var -- a scratch dir of extension folders.
 ///   2. `vendor/extensions` next to the crate -- the committed copy.
 ///   3. Tauri resource dir `extensions` -- the bundled copy.
+///   4. The build-time embedded archive (see build.rs), extracted once per
+///      app version under the app data dir -- this is what makes the
+///      standalone exe self-contained outside the source checkout.
 #[cfg(target_os = "windows")]
 fn find_extensions_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
   let looks_like_extensions_dir = |p: &std::path::Path| {
@@ -72,7 +75,92 @@ fn find_extensions_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     }
   }
 
+  if let Some(p) = extract_embedded_extensions(app) {
+    if looks_like_extensions_dir(&p) {
+      return Some(p);
+    }
+  }
+
   None
+}
+
+/// The Better Lyrics extension packed at build time (see build.rs). Lets the
+/// release exe carry the extension without the source checkout or an
+/// `extensions` folder placed next to the binary.
+#[cfg(target_os = "windows")]
+const BL_EXT_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/better_lyrics_ext.bin"));
+
+/// Extracts the embedded archive under the app data dir, once per app
+/// version. A `.pear-ok` marker written last guards against reusing a
+/// partial extraction from a crashed or failed run. Returns the *parent*
+/// directory -- wry registers one extension per child folder.
+#[cfg(target_os = "windows")]
+fn extract_embedded_extensions(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+  let target = app
+    .path()
+    .app_data_dir()
+    .ok()?
+    .join(format!("extensions-v{}", env!("CARGO_PKG_VERSION")));
+
+  if target.join(".pear-ok").is_file() {
+    return Some(target);
+  }
+
+  let extract = || -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+
+    let buf = BL_EXT_ARCHIVE;
+    let u32_at = |p: usize| -> Result<u32, String> {
+      buf
+        .get(p..p + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .ok_or_else(|| format!("archive truncated at {p}"))
+    };
+    let u16_at = |p: usize| -> Result<u16, String> {
+      buf
+        .get(p..p + 2)
+        .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+        .ok_or_else(|| format!("archive truncated at {p}"))
+    };
+
+    let count = u32_at(0)?;
+    let mut p = 4usize;
+    for _ in 0..count {
+      let path_len = u16_at(p)? as usize;
+      p += 2;
+      let rel = std::str::from_utf8(buf.get(p..p + path_len).ok_or("path truncated")?)
+        .map_err(|e| e.to_string())?;
+      p += path_len;
+      let data_len = u32_at(p)? as usize;
+      p += 4;
+      let data = buf.get(p..p + data_len).ok_or("data truncated")?;
+      p += data_len;
+
+      let out_path = target.join(rel);
+      if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+      }
+      std::fs::write(&out_path, data).map_err(|e| e.to_string())?;
+    }
+
+    std::fs::write(target.join(".pear-ok"), "ok").map_err(|e| e.to_string())?;
+    Ok(())
+  };
+
+  match extract() {
+    Ok(()) => {
+      diag_log(
+        "rust".into(),
+        format!("extensions: embedded archive extracted to {}", target.display()),
+      );
+      Some(target)
+    }
+    Err(e) => {
+      diag_log("rust".into(), format!("extensions: embedded extraction failed: {e}"));
+      None
+    }
+  }
 }
 
 #[tauri::command]
