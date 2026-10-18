@@ -596,3 +596,100 @@ commands, so no capability changes.
   Re-enabled with duration 4.0 (final state left active at 4 s).
 - Steady-state playback unaffected: context `running`, gain 1.0, no
   volume knockdown or audible artifacts.
+
+## 2026-10-18 — First Windows release: standalone signed exe
+
+### Goal
+Cut the first distributable Windows build: one self-contained exe with the
+Better Lyrics extension embedded, code-signed (free option only).
+
+### Commits
+- `3bbad40d` feat(tauri): port desktop app to Tauri v2 (Windows) with Better
+  Lyrics integration — 160 files (src-tauri/, ui/, tools/, vendored BL,
+  walkthrough.md, tauri-migration-plan.md).
+- `7580be38` build(release): embed Better Lyrics for a standalone exe +
+  size-tuned release profile.
+
+### Standalone design
+- `src-tauri/build.rs` packs `vendor/extensions/better-lyrics` (98 files,
+  ~5.2 MB) into a flat archive (`better_lyrics_ext.bin`: u32 count; per file
+  u16 path len + path + u32 data len + data; paths sorted).
+- `src-tauri/src/lib.rs` embeds it with `include_bytes!` and extracts once
+  per app version to `%APPDATA%\com.pear.desktop\extensions-v<version>\`
+  (marker `.pear-ok` written last guards against partial extractions).
+  `find_extensions_dir` order: `PEAR_BL_EXT` env -> `vendor/extensions` ->
+  resource dir -> embedded extraction.
+- `[profile.release] strip = true, lto = "thin"` in Cargo.toml.
+
+### Bug found during the standalone test
+First extraction produced a flat tree (the extension's files at the
+extraction root), so `looks_like_extensions_dir` failed and the app ran
+without extensions ("extensions dir NOT found" in diag). Root cause: the
+archive stored paths relative to the extension root, not its parent. Fix:
+prefix every path with `better-lyrics/` in build.rs, so the extracted dir is
+a valid wry extensions dir (one folder per extension). Re-verified.
+
+### End-to-end verification (standalone)
+- Copied the exe to `%TEMP%\pear-rel-test\`, renamed `vendor/extensions`
+  away, wiped the extraction dir, launched with CDP.
+- Extraction: manifest present, marker present, 99 files (98 + marker).
+- Diag log: "extensions: embedded archive extracted to ..." followed by
+  "extensions dir: ...\extensions-v0.1.0".
+- CDP target list included the BL service worker:
+  `chrome-extension://effdbpeggelllpfkjppbokhmmiinhlmg/background/service_worker.js`.
+
+### Signing (free, self-signed)
+- No CA cert on the machine and no budget => self-signed dev cert
+  `CN=Pear Desktop` (RSA-3072, SHA-256, expires 2029-10-18, thumbprint
+  `7FE1D5E851A7EE14D7286AEB52F50BFC52C10F0B`) in `Cert:\CurrentUser\My`.
+- `tools/sign.ps1` signs with signtool (auto-discovers the newest SDK
+  signtool) and timestamps via DigiCert; timestamp chain verifies against
+  DigiCert roots. Expected status elsewhere: untrusted root (self-signed).
+  Public cert exported to `dist\pear-desktop-dev.cer` for optional trusting
+  ("Trusted People"). Later, non-free-free options: SignPath Foundation
+  (free for OSS projects, application required) or Azure Trusted Signing
+  (~$10/mo).
+- Artifact: `dist\pear-desktop-0.1.0-x64.exe` (19.1 MB, signed +
+  timestamped) + `dist\pear-desktop-dev.cer`. The exe was re-cut once more
+  after the sidebar change below — final SHA256 recorded in that entry.
+
+### Gotchas learned
+- `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` is
+  ignored when a stale WebView2 browser process for the same user-data dir
+  is still alive — the new app silently attaches to it. Kill ALL
+  `msedgewebview2.exe` processes whose command line contains
+  `com.pear.desktop` before relaunching for CDP.
+- Extensions load only when `performance_mode` is false at startup
+  (WebView2 fixes the extension set at webview creation; the snapshot is
+  taken at startup).
+- The release exe needs `vendor/extensions` present at BUILD time (it is
+  embedded); hide it only for the runtime test.
+
+## 2026-10-18 — Sidebar "Upgrade" tab removed
+
+### Goal
+Remove the YouTube Music "Upgrade" (Premium) entry from the sidebar.
+
+### Changes (`ui/inject.js`)
+- New `removeUpgradeEntry()` step in the adaptive poll loop: removes any
+  `ytmusic-guide-entry-renderer` matching the premium icon or label.
+- Selector note: the Explore compass icon shares the same outer-circle path
+  prefix (`M12 1C5.925...`), so path-prefix matching wrongly removed Explore
+  too (caught in a live CDP test: 4 entries removed instead of 2). The
+  stable marker is the premium glyph's inner double-circle
+  `a6.5 6.5 0 100 13 6.5 6.5`, with the English label as fallback.
+- Removal is idempotent; both the full guide and the mini rail instances
+  are removed; re-renders are re-cleaned by the poll (400/1200 ms cadence).
+
+### Verification
+- Live CDP test: exactly 2 entries removed (full guide + rail), Explore and
+  all other entries kept.
+- After rebuild + fresh launch: 0 Upgrade entries, guide intact
+  (Home/Explore/Library/Liked music/Episodes for later, x2 instances).
+- Screenshot: `%TEMP%\opencode\upgrade-removed.png`.
+
+### Release artifact updated
+- Re-ran `cargo build --release`, copied to `dist\pear-desktop-0.1.0-x64.exe`
+  and re-signed with `tools\sign.ps1`.
+- Final artifact: 19.1 MB, SHA256
+  `389010BEF420FF254C0E7BE53431B46F6F8698002737E77828C48824577CC3EF`.

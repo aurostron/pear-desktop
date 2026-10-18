@@ -182,6 +182,23 @@
     }
   }
 
+  // YouTube Music ships an "Upgrade" (Premium) entry in both the full guide
+  // and the mini rail. Remove it -- this is a first-party app, no upsell.
+  // Matched on the premium icon's inner double-circle (locale-independent);
+  // the Explore compass shares the outer circles, so the marker must not be
+  // the path prefix alone. The English label stays as a fallback. Removal is
+  // idempotent (the node is simply gone on later polls).
+  const UPGRADE_ICON_MARK = 'a6.5 6.5 0 100 13 6.5 6.5';
+  function removeUpgradeEntry() {
+    for (const entry of document.querySelectorAll('ytmusic-guide-entry-renderer')) {
+      const d = entry.querySelector('yt-icon path')?.getAttribute('d') || '';
+      const label = (entry.textContent || '').trim();
+      if (d.includes(UPGRADE_ICON_MARK) || label === 'Upgrade') {
+        entry.remove();
+      }
+    }
+  }
+
   function injectWindowControls() {
     if (document.getElementById('tauri-window-controls')) return;
 
@@ -932,7 +949,7 @@
   // when paused or idle -- the player emits its own play/pause events, so the
   // slow poll is only a safety net. Idle CPU drops ~3x.
   (function poll() {
-    for (const step of [updateSongInfo, hookVideoEvents, hookVolumeWheel, replaceNavbarLogo, injectWindowControls, crossfadeTick]) {
+    for (const step of [updateSongInfo, hookVideoEvents, hookVolumeWheel, replaceNavbarLogo, removeUpgradeEntry, injectWindowControls, crossfadeTick]) {
       try {
         step();
       } catch (e) {}
