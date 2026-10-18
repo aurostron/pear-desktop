@@ -29,7 +29,12 @@ fn pack_extension_archive() {
         stack.push(path);
       } else {
         let rel = path.strip_prefix(&src).expect("strip prefix");
-        files.push((rel.to_string_lossy().replace('\\', "/"), path));
+        // keep the extension's folder name: the extracted tree must be a
+        // valid `extensions` dir (one folder per extension, as wry expects)
+        files.push((
+          format!("better-lyrics/{}", rel.to_string_lossy().replace('\\', "/")),
+          path,
+        ));
       }
     }
   }
